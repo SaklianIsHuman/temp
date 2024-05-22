@@ -1,0 +1,138 @@
+//LIBRARIES 
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <../../mover4/header/task_controller.h>
+#include <../../mover4/sol_mover4/kinematics.h>
+#include <../../mover4/header/tick.h>
+
+//VALUES
+#define SP_VALUES 10
+#define NON_BLOCKING 1
+#define JOINTS  4
+
+//double sp_angle_get(int i) {
+//    if (i == 0) return SP_VALUES;
+//    else if (i == 1) return SP_VALUES;
+//    else if (i == 2) return SP_VALUES;
+//    else if (i == 3) return SP_VALUES;
+//}
+
+//void traj_set(double *traj, int nb, int mode) {
+//    int i = 0;
+//    printf("\n");
+//    for (int j = 0; j < JOINTS; j++) {
+//        printf("jnt%d - ", j);
+//    }
+//    printf("\n");;
+//    printf("-----------------------------\n");
+//    for (int k = 0; k < nb * JOINTS; k++) {
+//        if ((k % JOINTS) == 0 && k!= 0) printf("%d\n", i++);
+//        printf("%3.2f  ", traj[k]);
+//    }
+//    printf("n: %d\n", i);
+//}
+
+#define VELO_MAX 10
+#define TICK_DURATION_MS 100
+
+void move_joints(double sp_jnt[JOINTS], int mode) {
+    double velo = VELO_MAX, rng_val, max_rng = 0, tf, t = 0, a3, a2, a1, a0, pv_jnt[4];
+
+    for (int i = 0; i < JOINTS; i++) {
+        pv_jnt[i] = sp_angle_get(i); // populate pv
+        rng_val = sp_jnt[i] - pv_jnt[i];
+        max_rng = (fabs(rng_val) > fabs(max_rng)) ? rng_val : max_rng; // max range
+    }
+
+    if (!max_rng) return;
+    velo = (fabs(max_rng / VELO_MAX) < 0.5) ? max_rng / 0.5 : VELO_MAX * max_rng / fabs(max_rng);
+    tf = max_rng / velo; // calculate final time
+    int nb = tf / 0.05; // num of points
+    auto traj_buff = new double[nb][JOINTS];
+
+    for (int i = 0; i < JOINTS; i++) {
+        a0 = pv_jnt[i];
+        a1 = 0;
+        a2 = ((3 / pow(tf, 2)) * (sp_jnt[i] - pv_jnt[i]));// - ((2 / tf) * a1);
+        a3 = ((-2 / pow(tf, 3)) * (sp_jnt[i] - pv_jnt[i]));// + ((1 / pow(tf, 2)) * a1);
+        for (int j = 0; j < nb; j++) {
+            t = j * 0.05;
+            traj_buff[j][i] = a0 + a1 * t + a2 * pow(t, 2) + a3 * pow(t, 3); // calc angle for time t
+        }
+    }
+    traj_set(traj_buff[0], nb, mode); // set trajectory for joints
+    if (mode == NON_BLOCKING) Sleep(tf * 500); // Sleep if non-blocking
+}
+
+
+void jog_joint(int joint_num, double step_min, double step_max, double inc) {
+    kin_f pv_jnt = all_sp_angles_get();
+    static long stamp = tick_get();
+    static double step = step_min;
+    double tf, t = 0, rng, velo = VELO_MAX, a3, a2, a1, a0;
+
+    if (tick_diff(stamp) < 100) step = (fabs(step) < fabs(step_max)) ? step + (inc * step) : step_max;
+    else step = step_min;
+    velo = (fabs(step / VELO_MAX) < 0.5) ? step / 0.5 : VELO_MAX * step / fabs(step);
+    tf = fabs(step / velo); // calculate final time
+    int nb = tf / 0.05; // num of points
+    auto traj_buff = new double[nb][JOINTS];
+
+    a0 = pv_jnt.data[joint_num];
+    a1 = velo;
+    a2 = ((3 / pow(tf, 2)) * step) - ((2 / tf) * a1);
+    a3 = ((-2 / pow(tf, 3)) * step) + ((1 / pow(tf, 2)) * a1);
+    for (int i = 0; i < JOINTS; i++) {
+        for (int j = 0; j < nb; j++) {
+            t = j * 0.05;
+            if (i == joint_num) traj_buff[j][i] = a0 + a1 * t + a2 * pow(t, 2) + a3 * pow(t, 3); // calc angle for time t
+            else traj_buff[j][i] = pv_jnt.data[i]; // populate other joints with pv value
+        }
+    }
+    traj_set(traj_buff[0], nb, NON_BLOCKING); // set trajectory for joint non blocking
+    Sleep(tf * 500);
+    stamp = tick_get();
+}
+
+
+void jog_z(double step_min, double step_max, double inc) {
+    kin_f pv_angle, pv_cart;
+    static long stamp = tick_get();
+    static double step = step_min;
+    double grip_to_horz, temp[JOINTS];
+
+    if (tick_diff(stamp) < 100) step = (fabs(step) < fabs(step_max)) ? step + (inc * step) : step_max;
+    else step = step_min;
+    pv_angle = all_sp_angles_get();
+    pv_cart = to_cart(pv_angle.data[0], pv_angle.data[1], pv_angle.data[2], pv_angle.data[3]);
+    if (pv_cart.data[2] != 0) pv_cart.data[2] += step; // increment/decrement z axis
+    grip_to_horz = pv_angle.data[1] + pv_angle.data[2] + pv_angle.data[3] - 90; // gripper keep horz 
+    pv_angle = to_angle(pv_cart.data[0], pv_cart.data[1], pv_cart.data[2], grip_to_horz);
+
+    for (int i = 0; i < JOINTS; i++) temp[i] = pv_angle.data[i];
+    move_joints(temp, NON_BLOCKING);
+    stamp = tick_get();
+}
+
+
+void jog_r(double step_min, double step_max, double inc) {
+    kin_f pv_angle, pv_cart;
+    static long stamp = tick_get();
+    static double step = step_min;
+    double x, y, grip_to_horz, temp[JOINTS];
+
+    if (tick_diff(stamp) < 100) (fabs(step) < fabs(step_max)) ? step += (inc * step) : step = step_max;
+    else step = step_min;
+    pv_angle = all_sp_angles_get();
+    pv_cart = to_cart(pv_angle.data[0], pv_angle.data[1], pv_angle.data[2], pv_angle.data[3]);
+    if (pv_cart.data[3] != 0) pv_cart.data[3] += step; // increment/decrement r axis
+    y = pv_cart.data[3] * sin(to_radians(pv_angle.data[0]));
+    x = pv_cart.data[3] * cos(to_radians(pv_angle.data[0]));
+    grip_to_horz = pv_angle.data[1] + pv_angle.data[2] + pv_angle.data[3] - 90; // gripper keep horz 
+    pv_angle = to_angle(x, y, pv_cart.data[2], grip_to_horz);
+
+    for (int i = 0; i < JOINTS; i++) temp[i] = pv_angle.data[i];
+    move_joints(temp, NON_BLOCKING);
+    stamp = tick_get();
+}
